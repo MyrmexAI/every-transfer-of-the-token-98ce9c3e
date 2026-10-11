@@ -688,3 +688,197 @@ fn unknown_instruction_is_rejected() {
     let ix = Instruction::new_with_bytes(env.program_id, &[1, 2], vec![]);
     assert!(env.send(&[ix], &[]).is_err());
 }
+
+#[test]
+fn execute_rejects_corrupted_stats_data() {
+    let mut r = ready();
+    let mint = r.env.mint.pubkey();
+    let (src, dst) = (Address::new_unique(), Address::new_unique());
+    r.env.put_token_account(&src, true, &mint);
+    r.env.put_token_account(&dst, true, &mint);
+
+    let stats_addr = r.env.stats_pda();
+    let original = r.env.svm.get_account(&stats_addr).unwrap();
+
+    let mut bad_magic = original.clone();
+    bad_magic.data[0] ^= 0xff;
+    r.env.svm.set_account(stats_addr, bad_magic).unwrap();
+    let ix = r.env.execute_ix(&src, &dst, &Address::new_unique(), 1);
+    let err = err_string(r.env.send(&[ix], &[]));
+    assert!(err.contains(ERR_STATS_NOT_INITIALIZED), "{err}");
+
+    let mut bad_len = original.clone();
+    bad_len.data.truncate(40);
+    r.env.svm.set_account(stats_addr, bad_len).unwrap();
+    let ix = r.env.execute_ix(&src, &dst, &Address::new_unique(), 1);
+    let err = err_string(r.env.send(&[ix], &[]));
+    assert!(err.contains(ERR_STATS_NOT_INITIALIZED), "{err}");
+
+    let mut bad_bump = original;
+    bad_bump.data[8] = bad_bump.data[8].wrapping_sub(1);
+    r.env.svm.set_account(stats_addr, bad_bump).unwrap();
+    let ix = r.env.execute_ix(&src, &dst, &Address::new_unique(), 1);
+    assert!(r.env.send(&[ix], &[]).is_err());
+}
+
+#[test]
+fn execute_rejects_metas_not_owned_by_program() {
+    let mut r = ready();
+    let mint = r.env.mint.pubkey();
+    let (src, dst) = (Address::new_unique(), Address::new_unique());
+    r.env.put_token_account(&src, true, &mint);
+    r.env.put_token_account(&dst, true, &mint);
+
+    let metas_addr = r.env.metas_pda();
+    let mut acc = r.env.svm.get_account(&metas_addr).unwrap();
+    acc.owner = SYSTEM;
+    acc.data = vec![];
+    r.env.svm.set_account(metas_addr, acc).unwrap();
+
+    let ix = r.env.execute_ix(&src, &dst, &Address::new_unique(), 1);
+    let err = err_string(r.env.send(&[ix], &[]));
+    assert!(err.contains(ERR_METAS_NOT_INITIALIZED), "{err}");
+}
+
+#[test]
+fn execute_rejects_bad_instruction_data_length() {
+    let mut r = ready();
+    let mint = r.env.mint.pubkey();
+    let (src, dst) = (Address::new_unique(), Address::new_unique());
+    r.env.put_token_account(&src, true, &mint);
+    r.env.put_token_account(&dst, true, &mint);
+
+    let mut ix = r.env.execute_ix(&src, &dst, &Address::new_unique(), 5);
+    ix.data.pop();
+    assert!(r.env.send(&[ix], &[]).is_err());
+    let mut ix = r.env.execute_ix(&src, &dst, &Address::new_unique(), 5);
+    ix.data.push(0);
+    assert!(r.env.send(&[ix], &[]).is_err());
+    assert_eq!(r.env.stats().count, 0);
+}
+
+#[test]
+fn execute_accepts_pool_vault_owner_off_curve() {
+    // Pool vaults are owned by a PDA of the pool program; the hook must not
+    // require the owner to be a signer or an on-curve key.
+    let mut r = ready();
+    let mint = r.env.mint.pubkey();
+    let (src, dst) = (Address::new_unique(), Address::new_unique());
+    r.env.put_token_account(&src, true, &mint);
+    r.env.put_token_account(&dst, true, &mint);
+    let (pool_authority, _) =
+        Address::find_program_address(&[b"pool_authority"], &Address::new_unique());
+
+    for amount in [10u64, 20] {
+        let ix = r.env.execute_ix(&src, &dst, &pool_authority, amount);
+        r.env.send(&[ix], &[]).expect("execute with PDA owner");
+    }
+    assert_eq!(
+        r.env.stats(),
+        Stats {
+            count: 2,
+            total: 30,
+            largest: 20
+        }
+    );
+}
+
+#[test]
+fn largest_tracks_maximum_not_latest() {
+    let mut r = ready();
+    let alice = r.alice.insecure_clone();
+    let (a, b) = (r.alice_ata, r.bob_ata);
+    for amount in [300u64, 7, 300, 299] {
+        r.env.transfer(&a, &b, &alice, amount).expect("transfer");
+    }
+    assert_eq!(
+        r.env.stats(),
+        Stats {
+            count: 4,
+            total: 906,
+            largest: 300
+        }
+    );
+}
+
+#[test]
+fn failed_transfer_does_not_change_stats() {
+    let mut r = ready();
+    let alice = r.alice.insecure_clone();
+    let (a, b) = (r.alice_ata, r.bob_ata);
+    // More than the balance: the token program fails and the tx is rolled back.
+    assert!(r.env.transfer(&a, &b, &alice, 2_000_000).is_err());
+    assert_eq!(r.env.stats().count, 0);
+}
+
+#[test]
+fn initialize_rejects_mint_without_authority() {
+    let mut env = Env::new();
+    env.create_mint();
+    let authority = Keypair::try_from(&env.authority.to_bytes()[..]).unwrap();
+
+    // SetAuthority(MintTokens -> None)
+    let data = vec![6, 0, 0];
+    let ix = Instruction::new_with_bytes(
+        TOKEN_2022,
+        &data,
+        vec![
+            AccountMeta::new(env.mint.pubkey(), false),
+            AccountMeta::new_readonly(authority.pubkey(), true),
+        ],
+    );
+    env.send(&[ix], &[&authority])
+        .expect("revoke mint authority");
+
+    let ix = env.initialize_ix(&authority.pubkey());
+    let err = err_string(env.send(&[ix], &[&authority]));
+    assert!(err.contains(ERR_INVALID_MINT), "{err}");
+    assert!(env.svm.get_account(&env.stats_pda()).is_none());
+}
+
+#[test]
+fn initialize_requires_writable_accounts() {
+    let mut env = Env::new();
+    env.create_mint();
+    let authority = Keypair::try_from(&env.authority.to_bytes()[..]).unwrap();
+
+    for idx in [0usize, 2, 4] {
+        let mut ix = env.initialize_ix(&authority.pubkey());
+        ix.accounts[idx].is_writable = false;
+        assert!(env.send(&[ix], &[&authority]).is_err(), "account {idx}");
+    }
+    assert!(env.svm.get_account(&env.metas_pda()).is_none());
+    assert!(env.svm.get_account(&env.stats_pda()).is_none());
+}
+
+#[test]
+fn initialize_ignores_passed_extra_account_list() {
+    let mut env = Env::new();
+    env.create_mint();
+    let authority = Keypair::try_from(&env.authority.to_bytes()[..]).unwrap();
+
+    let mut ix = env.initialize_ix(&authority.pubkey());
+    ix.data.truncate(8);
+    ix.data.extend_from_slice(&[0xAB; 40]);
+    env.send(&[ix], &[&authority])
+        .expect("initialize with junk list");
+
+    let metas = env.svm.get_account(&env.metas_pda()).unwrap();
+    assert_eq!(metas.data.len(), 51);
+    assert_eq!(
+        metas.data[17..28],
+        [1, 5, b's', b't', b'a', b't', b's', 3, 1, 0, 0]
+    );
+}
+
+#[test]
+fn initialize_rent_is_paid_by_authority() {
+    let mut env = Env::new();
+    env.create_mint();
+    let before = env.svm.get_balance(&env.authority.pubkey()).unwrap();
+    env.initialize().expect("initialize");
+    let after = env.svm.get_balance(&env.authority.pubkey()).unwrap();
+    let rent = env.svm.minimum_balance_for_rent_exemption(51)
+        + env.svm.minimum_balance_for_rent_exemption(48);
+    assert_eq!(before - after, rent);
+}
